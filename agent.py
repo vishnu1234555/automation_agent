@@ -23,11 +23,16 @@ load_dotenv()
 google_api_key = os.getenv("GEMINI_API_KEY")
 groq_api_key = os.getenv("GROQ_API_KEY")
 
-if not google_api_key or not groq_api_key:
-    logger.critical("FATAL: Missing GEMINI_API_KEY or GROQ_API_KEY in environment variables.")
-    exit(1)
+MISSING_KEYS = [
+    n for n, v in (("GEMINI_API_KEY", google_api_key), ("GROQ_API_KEY", groq_api_key)) if not v
+]
+if MISSING_KEYS:
+    # Reported here but not fatal until __main__, so the module stays importable
+    # for testing without credentials.
+    logger.critical("Missing environment variables: %s", ", ".join(MISSING_KEYS))
 
-os.environ["GEMINI_API_KEY"] = google_api_key
+if google_api_key:
+    os.environ["GEMINI_API_KEY"] = google_api_key
 
 # ==========================================
 # 2. IMPORTS & TOOLS REGISTRY
@@ -44,6 +49,7 @@ from Notion import list_databases, read_database, add_database_entry, create_dat
 from airtable_tools import sync_inventory_levels, generate_supply_report
 from jira_tools import create_bug_ticket, summarize_sprint_blockers
 from discord_tools import broadcast_server_announcement, get_recent_messages
+from tool_compiler import compile_groq_tools
 
 APP_NAME = "omni_workspace_agent"
 USER_ID = "production_user_01"
@@ -80,11 +86,14 @@ GOOGLE_CASCADE_MODELS = [
     "gemini-1.5-flash"
 ]
 
+# Verified against the live Groq API. llama-3.3-70b-versatile, qwen/qwen3-32b
+# and llama-3.1-8b-instant all return 404 ("does not exist or you do not have
+# access to it"), which left this fallback tier with one working model out of
+# four. The groq/compound models are reachable but reject the `tools` parameter
+# outright, so they cannot serve this agent at all.
 GROQ_CASCADE_MODELS = [
-    "llama-3.3-70b-versatile",
     "openai/gpt-oss-120b",
-    "qwen/qwen3-32b",
-    "llama-3.1-8b-instant"
+    "openai/gpt-oss-20b",
 ]
 
 
@@ -136,42 +145,8 @@ class GoogleEngine:
 
 
 # ==========================================
-# 4. GROQ ENGINE (Dynamic Compiler + Parallel Execution)
+# 4. GROQ ENGINE (Parallel Tool Execution; schema compiler in tool_compiler.py)
 # ==========================================
-def compile_groq_tools(functions: List[callable]) -> tuple:
-    groq_schema = []
-    function_map = {}
-    for func in functions:
-        sig = inspect.signature(func)
-        params = {"type": "object", "properties": {}, "required": []}
-        
-        for name, param in sig.parameters.items():
-            # TYPE-AWARE COMPILATION (UPGRADE 3)
-            param_type = "string" # Default
-            if param.annotation != inspect.Parameter.empty:
-                if param.annotation == int: param_type = "integer"
-                elif param.annotation == float: param_type = "number"
-                elif param.annotation == bool: param_type = "boolean"
-                elif param.annotation == list or getattr(param.annotation, '__origin__', None) == list: param_type = "array"
-                elif param.annotation == dict or getattr(param.annotation, '__origin__', None) == dict: param_type = "object"
-
-            params["properties"][name] = {"type": param_type}
-            
-            if param.default == inspect.Parameter.empty:
-                params["required"].append(name)
-                
-        groq_schema.append({
-            "type": "function",
-            "function": {
-                "name": func.__name__,
-                "description": func.__doc__ or "Executes a workspace action.",
-                "parameters": params
-            }
-        })
-        function_map[func.__name__] = func
-    return groq_schema, function_map
-
-
 class GroqEngine:
     def __init__(self):
         self.client = AsyncGroq(api_key=groq_api_key)
@@ -319,6 +294,15 @@ async def interactive_terminal():
             if final_agent_response:
                 session_history.append({"role": "assistant", "content": final_agent_response})
                     
+        except EOFError:
+            # input() hits EOF whenever stdin is not a TTY. `docker run -d`
+            # has no TTY, so the container exited instantly with a generic
+            # 'fatal loop error' that named nothing useful.
+            logger.error(
+                "stdin is closed, so this interactive agent cannot read input. "
+                "Run the container with `docker run -it`, not `-d`."
+            )
+            break
         except KeyboardInterrupt:
             print("\n\nProcess interrupted by user. Shutting down...")
             break
@@ -328,6 +312,8 @@ async def interactive_terminal():
             break
 
 if __name__ == "__main__":
+    if MISSING_KEYS:
+        sys.exit(1)
     try:
         asyncio.run(interactive_terminal())
     except KeyboardInterrupt:
